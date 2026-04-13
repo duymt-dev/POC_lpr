@@ -17,4 +17,3 @@
 # For current video (pwf2amf0gwaaaz1wsl18ywyayxuoyxmaap1e6w1.mp4):
 3=29F-027.94
 5=34A-592.73
-

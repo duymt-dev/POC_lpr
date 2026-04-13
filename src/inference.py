@@ -13,11 +13,18 @@ import cv2
 import numpy as np
 import torch
 
+try:
+    import easyocr
+except ImportError:
+    easyocr = None
+
 
 ROOT = Path(__file__).resolve().parents[1]
 YOLOV5_DIR = ROOT / "vendor" / "yolov5"
 if str(YOLOV5_DIR) not in sys.path:
     sys.path.insert(0, str(YOLOV5_DIR))
+
+_EASYOCR_READER = None
 
 from models.common import DetectMultiBackend
 from utils.augmentations import letterbox
@@ -718,6 +725,33 @@ def get_fsrcnn_model():
     return _FSRCNN_MODEL
 
 
+def get_easyocr_reader():
+    global _EASYOCR_READER
+    if easyocr is None:
+        return None
+    if _EASYOCR_READER is None:
+        _EASYOCR_READER = easyocr.Reader(["en"], gpu=False, verbose=False)
+    return _EASYOCR_READER
+
+
+def read_vehicle_text_easyocr(image: np.ndarray) -> list[tuple[str, float]]:
+    """Read free-form scene text from a vehicle crop using EasyOCR."""
+    reader = get_easyocr_reader()
+    if reader is None or image.size == 0:
+        return []
+
+    results = reader.readtext(image, detail=1, paragraph=False)
+    candidates: list[tuple[str, float]] = []
+    for result in results:
+        if len(result) < 3:
+            continue
+        _bbox, text, conf = result
+        normalized = normalize_vn_candidate(str(text))
+        if normalized:
+            candidates.append((normalized, float(conf)))
+    return candidates
+
+
 def save_car3_crop(
     debug_dir: Path,
     frame_idx: int,
@@ -754,6 +788,19 @@ def save_car3_crop(
         f.write(
             f'{frame_idx},{crop_w},{crop_h},"{raw_text}","{normalized}","{formatted}",{similarity:.3f}\n'
         )
+
+
+def save_car3_vehicle_region(
+    debug_dir: Path,
+    frame_idx: int,
+    region_name: str,
+    crop: np.ndarray,
+) -> None:
+    """Save enlarged vehicle-body crops around car#3 for manual inspection."""
+    car3_dir = debug_dir / "car3_analysis"
+    car3_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"f{frame_idx:05d}_{region_name}.jpg"
+    cv2.imwrite(str(car3_dir / filename), crop)
 
 
 def enhance_plate_crop(
@@ -820,6 +867,17 @@ def extract_vehicle_text_regions(
     """
     x1, y1, x2, y2 = car_bbox
     w, h = x2 - x1, y2 - y1
+
+    # When we only have a tiny plate-like bbox, aggressively expand it to approximate
+    # the surrounding vehicle body so fallback OCR can inspect windshield/body text.
+    if w < 120 or h < 60:
+        expand_w = max(w * 2, 90)
+        expand_h = max(h * 2, 45)
+        x1 = max(0, int(x1 - expand_w))
+        y1 = max(0, int(y1 - expand_h))
+        x2 = min(frame_shape[1], int(x2 + expand_w))
+        y2 = min(frame_shape[0], int(y2 + expand_h))
+        w, h = x2 - x1, y2 - y1
 
     regions = []
 
@@ -987,6 +1045,35 @@ class CarTracker:
         self.max_frames_missing = max_frames_missing
         self.history_window = history_window
 
+    def bbox_size_similarity(self, box1, box2):
+        w1 = max(1.0, box1[2] - box1[0])
+        h1 = max(1.0, box1[3] - box1[1])
+        w2 = max(1.0, box2[2] - box2[0])
+        h2 = max(1.0, box2[3] - box2[1])
+        w_ratio = min(w1, w2) / max(w1, w2)
+        h_ratio = min(h1, h2) / max(h1, h2)
+        return (w_ratio + h_ratio) / 2.0
+
+    def predict_bbox(self, car, frame_idx):
+        last_bbox = car["last_bbox"]
+        prev_bbox = car.get("prev_bbox")
+        prev_frame = car.get("prev_frame")
+        if prev_bbox is None or prev_frame is None or prev_frame == car["last_frame"]:
+            return last_bbox
+
+        dt = max(1, car["last_frame"] - prev_frame)
+        future_dt = max(0, frame_idx - car["last_frame"])
+        vx1 = (last_bbox[0] - prev_bbox[0]) / dt
+        vy1 = (last_bbox[1] - prev_bbox[1]) / dt
+        vx2 = (last_bbox[2] - prev_bbox[2]) / dt
+        vy2 = (last_bbox[3] - prev_bbox[3]) / dt
+        return [
+            last_bbox[0] + vx1 * future_dt,
+            last_bbox[1] + vy1 * future_dt,
+            last_bbox[2] + vx2 * future_dt,
+            last_bbox[3] + vy2 * future_dt,
+        ]
+
     def compute_iou(self, box1, box2):
         x1 = max(box1[0], box2[0])
         y1 = max(box1[1], box2[1])
@@ -1008,11 +1095,19 @@ class CarTracker:
         for car_id, car in self.cars.items():
             if frame_idx - car["last_frame"] > self.max_frames_missing:
                 continue
+            predicted_bbox = self.predict_bbox(car, frame_idx)
             iou = self.compute_iou(bbox, car["last_bbox"])
-            pcx, pcy = self.centroid(car["last_bbox"])
+            predicted_iou = self.compute_iou(bbox, predicted_bbox)
+            size_sim = self.bbox_size_similarity(bbox, car["last_bbox"])
+            pcx, pcy = self.centroid(predicted_bbox)
             dist = ((cx - pcx) ** 2 + (cy - pcy) ** 2) ** 0.5
-            score = iou * 0.7 + max(0.0, 1.0 - dist / self.max_distance) * 0.3
-            if score > best_score and (iou > 0.05 or dist < self.max_distance):
+            dist_score = max(0.0, 1.0 - dist / self.max_distance)
+            score = (
+                predicted_iou * 0.45 + iou * 0.20 + dist_score * 0.25 + size_sim * 0.10
+            )
+            if score > best_score and (
+                predicted_iou > 0.02 or iou > 0.02 or dist < self.max_distance
+            ):
                 best_score = score
                 best_id = car_id
 
@@ -1023,7 +1118,9 @@ class CarTracker:
                 "text_history": [],  # list of (frame_idx, raw_text, conf, crop_w, crop_h)
                 "vehicle_text_history": [],  # list of (frame_idx, raw_text, normalized_text, score, region)
                 "last_bbox": bbox,
+                "prev_bbox": None,
                 "last_frame": frame_idx,
+                "prev_frame": None,
                 "first_frame": frame_idx,
                 "frame_count": 0,
                 "best_plate": "",
@@ -1032,6 +1129,8 @@ class CarTracker:
                 "best_vehicle_conf": 0.0,
             }
 
+        self.cars[best_id]["prev_bbox"] = self.cars[best_id].get("last_bbox")
+        self.cars[best_id]["prev_frame"] = self.cars[best_id].get("last_frame")
         self.cars[best_id]["last_bbox"] = bbox
         self.cars[best_id]["last_frame"] = frame_idx
         self.cars[best_id]["frame_count"] += 1
@@ -1946,9 +2045,20 @@ def main() -> None:
             if plate_is_weak and frame_idx >= PLATE_MIN_FRAMES_FOR_FALLBACK:
                 # Extract text from vehicle body regions
                 frame_shape = frame.shape
-                vehicle_regions = extract_vehicle_text_regions(
-                    (x1, y1, x2, y2), frame_shape
-                )
+                # Use car bbox if available, otherwise expand plate bbox
+                if car_id in car_tracker.cars:
+                    car_bbox = car_tracker.cars[car_id]["last_bbox"]
+                else:
+                    # Fallback: expand plate bbox by 3x to approximate car size
+                    plate_w, plate_h = int(x2 - x1), int(y2 - y1)
+                    expand_w, expand_h = plate_w * 3, plate_h * 3
+                    car_bbox = [
+                        max(0, int(x1 - expand_w)),
+                        max(0, int(y1 - expand_h)),
+                        min(frame_shape[1], int(x2 + expand_w)),
+                        min(frame_shape[0], int(y2 + expand_h)),
+                    ]
+                vehicle_regions = extract_vehicle_text_regions(car_bbox, frame_shape)
 
                 best_vehicle_score = 0.0
 
@@ -1957,6 +2067,14 @@ def main() -> None:
                     vehicle_crop = frame[ry1:ry2, rx1:rx2]
                     if vehicle_crop.size == 0:
                         continue
+
+                    if car_id == 3 and frame_idx == 619:
+                        save_car3_vehicle_region(
+                            debug_dir,
+                            frame_idx,
+                            f"vehicle_region_{region_idx}",
+                            vehicle_crop.copy(),
+                        )
 
                     # Enhance the vehicle crop for better text detection
                     enhanced_vehicle = enhance_plate_crop(
@@ -1973,9 +2091,7 @@ def main() -> None:
                         or enhanced_vehicle.shape[1] < 150
                         else args.imgsz
                     )
-                    vehicle_local_conf = (
-                        0.02  # Lower confidence for vehicle text detection
-                    )
+                    vehicle_local_conf = 0.02
                     vehicle_dets = run_yolov5(
                         ocr_model,
                         enhanced_vehicle,
@@ -2016,7 +2132,16 @@ def main() -> None:
                         if vehicle_chars_local
                         else 0.0
                     )
-                    vehicle_quality_local = plate_candidate_score(vehicle_norm_local)
+
+                    easy_candidates = read_vehicle_text_easyocr(enhanced_vehicle)
+                    if easy_candidates:
+                        best_easy_text, best_easy_conf = max(
+                            easy_candidates, key=lambda item: item[1]
+                        )
+                        if best_easy_conf >= vehicle_conf_local:
+                            vehicle_raw_text_local = best_easy_text
+                            vehicle_norm_local = best_easy_text
+                            vehicle_conf_local = best_easy_conf
 
                     # Skip if no text detected
                     if (
@@ -2060,8 +2185,10 @@ def main() -> None:
                                 ]
                             )
 
+                    is_selected = vehicle_score > best_vehicle_score
+
                     # Track best vehicle text candidate
-                    if vehicle_score > best_vehicle_score:
+                    if is_selected:
                         best_vehicle_score = vehicle_score
                         vehicle_text = vehicle_norm_local
                         vehicle_conf = vehicle_conf_local
@@ -2076,7 +2203,7 @@ def main() -> None:
                         normalized_candidate=vehicle_norm_local,
                         score=vehicle_score,
                         ocr_conf=vehicle_conf_local,
-                        selected_now=(vehicle_score >= best_vehicle_score),
+                        selected_now=is_selected,
                     )
 
             # Special tracking for car#3 with known ground truth

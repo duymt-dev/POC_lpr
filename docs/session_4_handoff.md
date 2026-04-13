@@ -254,6 +254,229 @@ Sau commit `0917cfe`, đã phát hiện và sửa thêm một số lỗi runtime
 - Trong 300 frames đầu chưa có candidate vehicle-text nào đủ điều kiện để được log
 - Điều này cho thấy fallback path hiện chưa mang lại evidence hữu ích trên đoạn video ngắn đầu tiên, cần test ở các frame có xe lớn hơn hoặc video khác
 
+### Session 4 Continued: Car#3 / Car#5 Investigation
+
+Sau phần fallback cơ bản, session 4 tiếp tục đào sâu vào 2 vấn đề thực tế:
+
+1. **Car#3:** bỏ manual correction để kiểm tra xem fallback OCR text trên thân xe có tự cứu được không
+2. **Car#5:** điều tra vì sao candidate đúng `41K-344.45` không trở thành kết quả ổn định cuối cùng
+
+#### 1. Car#3: Manual correction OFF test
+
+Đã tắt tạm dòng manual correction của `car#3` trong `docs/manual_correction.txt` để test.
+
+**Run:**
+
+```bash
+python src/inference.py \
+  --output output/test_car3_vehicle_fallback.mp4 \
+  --det-conf 0.15 \
+  --ocr-conf 0.10 \
+  --car-conf 0.25 \
+  --max-frames 700
+```
+
+**Kết quả:**
+- `car#3` vẫn chỉ xuất hiện ở `frame 619`
+- Plate OCR vẫn ra `8540`
+- Vehicle fallback ban đầu không hữu ích vì đang dựa quá nhiều vào bbox nhỏ
+
+#### 2. Aggressive ROI expansion for tiny/plate-only bbox
+
+**Root cause đã xác định:** với case không có `car bbox` rõ ràng hoặc bbox quá nhỏ, fallback ROI chưa lấy đủ context thân xe.
+
+**Đã làm:**
+- Thêm regression test: `tests/test_vehicle_text_regions.py`
+- Test fail trước khi sửa vì ROI width chỉ bằng plate bbox (`58px`)
+- Sửa `extract_vehicle_text_regions()` để tự động expand mạnh nếu bbox nhỏ:
+  - nếu `w < 120` hoặc `h < 60`
+  - mở rộng thêm context theo cả chiều ngang và dọc
+
+**Verification:**
+
+```bash
+python tests/test_vehicle_text_regions.py
+```
+
+**Kết quả:** `ok`
+
+#### 3. Dedicated scene-text backend for vehicle fallback
+
+**Đã cài:**
+
+```bash
+pip install easyocr
+```
+
+**Đã tích hợp vào `src/inference.py`:**
+- `get_easyocr_reader()`
+- `read_vehicle_text_easyocr(image)`
+
+Logic mới:
+1. fallback vẫn chạy OCR model biển số như cũ trên vehicle regions
+2. sau đó thử thêm `EasyOCR` trên cùng crop
+3. nếu EasyOCR cho candidate tốt hơn theo confidence thì dùng candidate đó cho vehicle fallback
+
+#### 4. Manual enlarged crop analysis quanh frame 619
+
+Đã thêm function:
+- `save_car3_vehicle_region()`
+
+Để lưu các crop lớn quanh `car#3` frame `619` phục vụ soi thủ công.
+
+**Artifacts đã tạo:**
+- `debug_crops/car3_analysis/f00619_vehicle_region_0.jpg`
+- `debug_crops/car3_analysis/f00619_vehicle_region_1.jpg`
+- `debug_crops/car3_analysis/f00619_vehicle_region_2.jpg`
+- `debug_crops/car3_analysis/f00619_vehicle_region_3.jpg`
+- `debug_crops/car3_analysis/f00619_vehicle_region_4.jpg`
+- `debug_crops/car3_analysis/f00619_vehicle_region_5.jpg`
+- `debug_crops/car3_analysis/f00619_w58_h29_sim0.00_8540_8540.jpg`
+
+#### 5. Car#3 results after aggressive fallback + EasyOCR
+
+**Run:**
+
+```bash
+python src/inference.py \
+  --output output/test_car3_easyocr_fallback.mp4 \
+  --det-conf 0.15 \
+  --ocr-conf 0.10 \
+  --car-conf 0.25 \
+  --max-frames 700
+```
+
+**Vehicle fallback log for car#3:**
+
+```text
+3,619,"region_0","M459","1459",0.000,0.034,False
+3,619,"region_1","MFG0","1F60",0.000,0.112,False
+```
+
+**Plate log for car#3:**
+
+```text
+3,619,"8540","B|54D","8540","8540",10.000,0.153,58,29,"8540","8540"
+```
+
+**Kết luận car#3:**
+- Fallback path **có chạy**
+- EasyOCR backend **đã chạy**
+- Nhưng **không đọc ra được text hữu ích** để suy ra `29F-027.94`
+- Với case này, dữ liệu frame `619` vẫn quá yếu để OCR tự động phục hồi
+- **Manual correction vẫn là giải pháp cần thiết cho car#3**
+
+#### 6. Restore manual correction for car#3
+
+Sau khi test xong, đã bật lại manual correction trong `docs/manual_correction.txt`:
+
+```text
+3=29F-027.94
+5=34A-592.73
+```
+
+**Verification run:**
+
+```bash
+python src/inference.py \
+  --output output/test_manual_correction_restore.mp4 \
+  --det-conf 0.15 \
+  --ocr-conf 0.10 \
+  --car-conf 0.25 \
+  --max-frames 700
+```
+
+**Runtime evidence:**
+
+```text
+Loaded manual corrections: {3: '29F-027.94', 5: '34A-592.73'}
+```
+
+#### 7. Full video verification with restored manual corrections
+
+**Run:**
+
+```bash
+python src/inference.py \
+  --output output/test_full_video_manual_correction.mp4 \
+  --det-conf 0.15 \
+  --ocr-conf 0.10 \
+  --car-conf 0.25
+```
+
+**Kết quả:**
+- chạy thành công trên toàn bộ `1841` frames
+- output: `output/test_full_video_manual_correction.mp4`
+- file size: `100405156` bytes
+- `debug_crops/summary.csv`: `155` lines
+- `debug_crops/car_candidates.csv`: `211` lines
+
+#### 8. Car#5 investigation: why `41K-344.45` was not the final stable result
+
+**Discovery quan trọng:** `41K-344.45` thực ra **đã từng được chọn đúng** cho `car#5`.
+
+**Evidence from `car_candidates.csv`:**
+
+```text
+5,826,"41K34445","4LKE4A45","41K34445","41K-344.45",15.000,0.212,36,17,"41K34445","41K-344.45"
+5,828,...,"41K-344.45"
+5,829,...,"41K-344.45"
+5,830,...,"41K-344.45"
+5,831,...,"41K-344.45"
+```
+
+Nghĩa là candidate đúng đã thắng cục bộ ở đoạn này.
+
+**Nhưng vấn đề lớn hơn:**
+- Sau frame `831`, xe tương ứng không còn nằm trên `car_id=5`
+- Từ frame `1184` trở đi, một chuỗi candidate mới xuất hiện dưới `car_id=6`
+- Hệ thống hiện tại **không merge history giữa các car IDs**
+
+=> Candidate đúng `41K-344.45` không đủ ảnh hưởng để trở thành kết quả ổn định cho toàn bộ object nếu object bị re-identified thành ID mới.
+
+#### 9. Tracker investigation (`CarTracker.match_car`)
+
+Đã điều tra hướng tracking split trước khi sửa logic chọn plate.
+
+**Đã thêm vào tracker:**
+- `prev_bbox`
+- `prev_frame`
+- `bbox_size_similarity()`
+- `predict_bbox()`
+
+**Logic match mới:**
+- kết hợp `predicted_iou`
+- `iou` hiện tại
+- khoảng cách tới bbox dự đoán
+- độ tương đồng kích thước bbox
+
+**Verification:**
+
+```bash
+python tests/test_vehicle_text_regions.py
+python src/inference.py --output output/test_tracker_fix_car5.mp4 --det-conf 0.15 --ocr-conf 0.10 --car-conf 0.25 --max-frames 1450
+```
+
+**Kết luận sau tracker investigation:**
+- Sửa tracker **không loại bỏ được việc `car#5` rồi thành `car#6`**
+- Vì đây **không phải short-gap split đơn giản**
+- Hai đoạn candidate bị cách nhau rất xa (`831 -> 1184`)
+- Tracker centroid-based hiện tại sẽ hợp lý khi coi đó là object mới
+
+**Kết luận kỹ thuật:**
+- Root cause hiện tại **không còn nằm chủ yếu ở `match_car()`**
+- Mà ở chỗ hệ thống **không có cơ chế re-association / merge plate evidence giữa nhiều `car_id`**
+
+### Current Best Understanding
+
+Nếu muốn "lấy được plate đúng gắn với car 5" rồi dùng logic đó tốt hơn cho mọi car, hướng đúng tiếp theo là:
+
+1. giữ candidate strong-valid như `41K34445`
+2. xây lớp **plate-evidence merge / re-association** giữa các `car_id`
+3. nếu `car#5` và `car#6` có evidence plate rất gần nhau hoặc cùng scene trajectory rộng hơn, nối history hoặc chuyển `best_plate`
+
+Nói ngắn gọn: vấn đề còn lại là **identity merge by plate evidence**, không chỉ là OCR hay short-gap tracking nữa.
+
 ### Improvements vs Session 3
 
 1. **FSRCNN working:** opencv-contrib-python installed
