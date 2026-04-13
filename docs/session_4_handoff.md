@@ -228,6 +228,32 @@ python src/inference.py \
 - `output/test_vehicle_text.mp4` - Video với vehicle text fallback
 - Detected 1 active car trong 200 frames đầu
 
+### Post-Commit Runtime Fixes
+
+Sau commit `0917cfe`, đã phát hiện và sửa thêm một số lỗi runtime khi chạy dài hơn:
+
+1. Fixed indentation issues trong `enhance_plate_crop()`
+2. Fixed ROI slice types trong `extract_vehicle_text_regions()` bằng cách ép toàn bộ coords về `int`
+3. Fixed `vehicle_text_history` tuple unpack trong `score_vehicle_text_candidate()`
+4. Fixed thứ tự khởi tạo `box_color` trước khi tính `final_color`
+5. Added `log_vehicle_text_candidate()` để log riêng vehicle fallback path
+
+### Verification Sau Runtime Fix
+
+**Short run 300 frames:**
+- `output/test_vehicle_text_retry.mp4`
+- ✅ chạy thành công
+
+**Full run 1000 frames:**
+- `output/test_vehicle_text_full_retry.mp4`
+- ✅ chạy thành công
+- không còn crash tại đoạn vehicle fallback
+
+**Vehicle text logging:**
+- Đã thêm `debug_crops/vehicle_text_candidates.csv`
+- Trong 300 frames đầu chưa có candidate vehicle-text nào đủ điều kiện để được log
+- Điều này cho thấy fallback path hiện chưa mang lại evidence hữu ích trên đoạn video ngắn đầu tiên, cần test ở các frame có xe lớn hơn hoặc video khác
+
 ### Improvements vs Session 3
 
 1. **FSRCNN working:** opencv-contrib-python installed

@@ -943,7 +943,11 @@ def score_vehicle_text_candidate(
     if car_id in car_tracker.cars:
         vehicle_history = car_tracker.cars[car_id].get("vehicle_text_history", [])
         # Count how many times this exact text appeared recently
-        recent_matches = sum(1 for f, t, c in vehicle_history[-10:] if t == normalized)
+        recent_matches = sum(
+            1
+            for _f, _raw, norm_txt, _score, _region in vehicle_history[-10:]
+            if norm_txt == normalized
+        )
         stability_score = min(recent_matches * 0.5, 2.0)  # Max 2.0 points
 
     # Blacklist penalty
@@ -1439,6 +1443,31 @@ def log_car_candidate(
             )
         f.write(
             f'{car_id},{frame_idx},"{raw_text}","{row_texts_str}","{normalized_candidate}","{formatted_candidate}",{plate_score:.3f},{ocr_conf:.3f},{crop_w},{crop_h},"{best_raw_now}","{best_formatted_now}"\n'
+        )
+
+
+def log_vehicle_text_candidate(
+    debug_dir: Path,
+    car_id: int,
+    frame_idx: int,
+    region: str,
+    raw_text: str,
+    normalized_candidate: str,
+    score: float,
+    ocr_conf: float,
+    selected_now: bool,
+) -> None:
+    """Log vehicle-body text candidates used by the fallback path."""
+    candidates_path = debug_dir / "vehicle_text_candidates.csv"
+    file_exists = candidates_path.exists()
+
+    with open(candidates_path, "a", newline="", encoding="utf-8") as f:
+        if not file_exists:
+            f.write(
+                "car_id,frame,region,raw_text,normalized_candidate,score,ocr_conf,selected_now\n"
+            )
+        f.write(
+            f'{car_id},{frame_idx},"{region}","{raw_text}","{normalized_candidate}",{score:.3f},{ocr_conf:.3f},{selected_now}\n'
         )
 
 
@@ -2037,6 +2066,18 @@ def main() -> None:
                         vehicle_text = vehicle_norm_local
                         vehicle_conf = vehicle_conf_local
                         vehicle_text_source = f"region_{region_idx}"
+
+                    log_vehicle_text_candidate(
+                        debug_dir=debug_dir,
+                        car_id=car_id,
+                        frame_idx=frame_idx,
+                        region=f"region_{region_idx}",
+                        raw_text=vehicle_raw_text_local,
+                        normalized_candidate=vehicle_norm_local,
+                        score=vehicle_score,
+                        ocr_conf=vehicle_conf_local,
+                        selected_now=(vehicle_score >= best_vehicle_score),
+                    )
 
             # Special tracking for car#3 with known ground truth
             if car_id == 3:
