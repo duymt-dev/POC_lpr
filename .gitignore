@@ -1,0 +1,13 @@
+debug_crops/
+output/
+video test/
+*.mp4
+*.avi
+*.mkv
+*.exe
+*.dll
+*.lock
+service.conf.lock
+system.conf.lock
+AnyDesk.exe
+gcapi.dll

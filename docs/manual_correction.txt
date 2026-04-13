@@ -1,0 +1,20 @@
+# Manual Correction File - VIDEO SPECIFIC!
+# 
+# ⚠️ IMPORTANT: car_id is assigned per video based on detection order.
+# Different videos will have different car_ids!
+#
+# HOW TO USE:
+# 1. Run inference once WITHOUT corrections to see car_ids in video panel
+# 2. Note which car_id needs correction
+# 3. Add correction here: car_id=plate_number
+# 4. Run inference again
+#
+# Format: car_id=plate_number
+# Example:
+#   3=29F-027.94
+#   5=34A-592.73
+#
+# For current video (pwf2amf0gwaaaz1wsl18ywyayxuoyxmaap1e6w1.mp4):
+3=29F-027.94
+5=34A-592.73
+
