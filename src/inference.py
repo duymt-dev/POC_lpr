@@ -1040,10 +1040,15 @@ class CarTracker:
 
     def __init__(self, max_frames_missing: int = 45, history_window: int = 20):
         self.next_car_id = 1
-        self.cars = {}
+        self.cars = {}  # Active cars
+        self.lost_cars = {}  # Lost cars pool for re-identification
+        self.car_aliases = {}  # Mapping: merged_id -> original_id
         self.max_distance = 150.0
         self.max_frames_missing = max_frames_missing
         self.history_window = history_window
+        self.reid_check_interval = 30  # Check for re-ID every 30 frames
+        self.reid_similarity_threshold = 0.7  # Plate similarity threshold for merge
+        self.reid_max_gap = 600  # Max frames to keep car in lost_cars pool (increased to cover larger gaps)
 
     def bbox_size_similarity(self, box1, box2):
         w1 = max(1.0, box1[2] - box1[0])
@@ -1127,6 +1132,8 @@ class CarTracker:
                 "best_conf": 0.0,
                 "best_vehicle_text": "",
                 "best_vehicle_conf": 0.0,
+                "merged_into": None,  # If merged, points to target car_id
+                "merged_from": [],  # List of car_ids merged into this one
             }
 
         self.cars[best_id]["prev_bbox"] = self.cars[best_id].get("last_bbox")
@@ -1344,13 +1351,30 @@ class CarTracker:
             car["best_conf"] = conf
 
     def cleanup_old_cars(self, current_frame):
-        to_remove = [
+        """Move timed-out cars to lost_cars pool instead of deleting."""
+        to_move = [
             cid
             for cid, car in self.cars.items()
             if current_frame - car["last_frame"] > self.max_frames_missing
+            and car.get("merged_into") is None  # Don't move merged cars
+        ]
+        for cid in to_move:
+            # Move to lost_cars pool
+            self.lost_cars[cid] = self.cars[cid]
+            del self.cars[cid]
+            print(
+                f"[TRACKER] Car#{cid} moved to lost_cars pool (plate: {self.lost_cars[cid]['best_plate']})"
+            )
+
+        # Cleanup very old lost cars
+        to_remove = [
+            cid
+            for cid, car in self.lost_cars.items()
+            if current_frame - car["last_frame"] > self.reid_max_gap
         ]
         for cid in to_remove:
-            del self.cars[cid]
+            del self.lost_cars[cid]
+            print(f"[TRACKER] Car#{cid} removed from lost_cars pool (too old)")
 
     def get_active_cars(self, current_frame, max_age=20):
         return [
@@ -1358,6 +1382,165 @@ class CarTracker:
             for cid, car in self.cars.items()
             if current_frame - car["last_frame"] <= max_age
         ]
+
+    def check_plate_reid(self, car_id, frame_idx):
+        """Check if this car matches any lost car by plate similarity.
+
+        Returns the matched lost car_id if found, None otherwise.
+        """
+        if car_id not in self.cars:
+            return None
+
+        car = self.cars[car_id]
+        current_plate = car["best_plate"]
+
+        # Need at least 3 frames with plate to be confident
+        if car["frame_count"] < 3 or not current_plate or len(current_plate) < 6:
+            return None
+
+        # Already merged? Skip
+        if car.get("merged_into") is not None:
+            return None
+
+        # Search lost_cars pool
+        best_match_id = None
+        best_similarity = 0.0
+
+        # Debug: log search attempt
+        if len(self.lost_cars) > 0:
+            print(
+                f"[REID] Checking car#{car_id} (plate: '{current_plate}', frames: {car['frame_count']}) against {len(self.lost_cars)} lost cars"
+            )
+
+        for lost_id, lost_car in self.lost_cars.items():
+            lost_plate = lost_car["best_plate"]
+            if not lost_plate or len(lost_plate) < 6:
+                continue
+
+            # Calculate plate similarity
+            sim = plate_similarity(current_plate, lost_plate)
+
+            # Debug: log comparison
+            if sim > 0.5:  # Log if similarity is significant
+                print(
+                    f"[REID] Car#{car_id} ('{current_plate}') vs lost car#{lost_id} ('{lost_plate}'): similarity={sim:.2f}"
+                )
+
+            if sim >= self.reid_similarity_threshold and sim > best_similarity:
+                best_similarity = sim
+                best_match_id = lost_id
+
+        if best_match_id:
+            # Found a match! Merge car_id into lost_id
+            print(
+                f"[REID] Car#{car_id} matches lost car#{best_match_id} (similarity: {best_similarity:.2f}, plates: '{current_plate}' vs '{self.lost_cars[best_match_id]['best_plate']}')"
+            )
+            self.merge_car_histories(source_id=car_id, target_id=best_match_id)
+            return best_match_id
+
+        return None
+
+    def merge_car_histories(self, source_id, target_id):
+        """Merge source car history into target car.
+
+        Strategy:
+        - Target car may be in lost_cars pool (inactive)
+        - Source car remains active for spatial tracking
+        - Transfer all text_history from source to target
+        - Mark source as merged_into target
+        - Reactivate target if it was lost
+        """
+        if source_id not in self.cars:
+            return
+
+        source = self.cars[source_id]
+
+        # Get or reactivate target
+        if target_id in self.cars:
+            target = self.cars[target_id]
+        elif target_id in self.lost_cars:
+            # Reactivate lost car
+            target = self.lost_cars[target_id]
+            self.cars[target_id] = target
+            del self.lost_cars[target_id]
+            print(f"[REID] Reactivated car#{target_id} from lost_cars pool")
+        else:
+            print(
+                f"[REID] Warning: Target car#{target_id} not found in cars or lost_cars"
+            )
+            return
+
+        # Transfer histories
+        target["text_history"].extend(source["text_history"])
+        target["vehicle_text_history"].extend(source["vehicle_text_history"])
+
+        # Keep only recent window
+        if len(target["text_history"]) > self.history_window * 2:
+            target["text_history"] = target["text_history"][-self.history_window * 2 :]
+        if len(target["vehicle_text_history"]) > self.history_window * 2:
+            target["vehicle_text_history"] = target["vehicle_text_history"][
+                -self.history_window * 2 :
+            ]
+
+        # Update target metadata with source's current state
+        target["last_bbox"] = source["last_bbox"]
+        target["prev_bbox"] = source["prev_bbox"]
+        target["last_frame"] = source["last_frame"]
+        target["prev_frame"] = source["prev_frame"]
+        target["frame_count"] += source["frame_count"]
+
+        # Recalculate best_plate from merged history
+        new_best_plate, new_best_conf = self.get_best_plate(target_id)
+        if new_best_plate:
+            target["best_plate"] = new_best_plate
+            target["best_conf"] = new_best_conf
+
+        # Mark source as merged
+        source["merged_into"] = target_id
+        target["merged_from"].append(source_id)
+
+        # Create alias mapping
+        self.car_aliases[source_id] = target_id
+
+        print(
+            f"[REID] Merged car#{source_id} into car#{target_id} (plate: {target['best_plate']}, frames: {target['frame_count']})"
+        )
+
+    def detect_plate_conflicts(self, frame_idx):
+        """Detect if multiple active cars have the same plate.
+
+        Strategy: Merge older car into newer car.
+        """
+        # Build plate → car_id mapping
+        plate_map = {}
+        for car_id, car in self.cars.items():
+            if car.get("merged_into") is not None:
+                continue  # Skip already merged cars
+
+            plate = car["best_plate"]
+            if not plate or len(plate) < 6:
+                continue
+
+            if plate not in plate_map:
+                plate_map[plate] = []
+            plate_map[plate].append((car_id, car))
+
+        # Find conflicts
+        for plate, cars_list in plate_map.items():
+            if len(cars_list) <= 1:
+                continue
+
+            # Sort by first_frame (older first)
+            cars_list.sort(key=lambda x: x[1]["first_frame"])
+
+            # Merge all into the oldest one
+            target_id, target_car = cars_list[0]
+
+            for source_id, source_car in cars_list[1:]:
+                print(
+                    f"[CONFLICT] Detected duplicate plate '{plate}': car#{source_id} and car#{target_id}"
+                )
+                self.merge_car_histories(source_id, target_id)
 
 
 def reconstruct_plate(char_pool):
@@ -2305,6 +2488,19 @@ def main() -> None:
         # Cleanup stale cars
         car_tracker.cleanup_old_cars(frame_idx)
 
+        # Periodic plate-based re-identification check
+        if frame_idx % car_tracker.reid_check_interval == 0:
+            # Check for plate-based re-identification
+            for car_id in list(car_tracker.cars.keys()):
+                matched_id = car_tracker.check_plate_reid(car_id, frame_idx)
+                if matched_id:
+                    print(
+                        f"Frame {frame_idx}: Re-identified car#{car_id} as car#{matched_id}"
+                    )
+
+            # Check for conflicts
+            car_tracker.detect_plate_conflicts(frame_idx)
+
         frame_ms = (perf_counter() - frame_start) * 1000.0
         timings = {
             "detect_ms": detect_ms,
@@ -2316,6 +2512,10 @@ def main() -> None:
         active_cars = car_tracker.get_active_cars(frame_idx, max_age=25)
         car_plates = []
         for car_id, car in sorted(active_cars, key=lambda x: -x[1]["frame_count"]):
+            # Skip merged cars in display
+            if car.get("merged_into") is not None:
+                continue
+
             best_raw, best_conf = car_tracker.get_best_plate(car_id)
             best_vehicle_text, best_vehicle_conf = car_tracker.get_best_vehicle_text(
                 car_id
