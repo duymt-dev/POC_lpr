@@ -1047,7 +1047,7 @@ class CarTracker:
         self.max_frames_missing = max_frames_missing
         self.history_window = history_window
         self.reid_check_interval = 30  # Check for re-ID every 30 frames
-        self.reid_similarity_threshold = 0.7  # Plate similarity threshold for merge
+        self.reid_similarity_threshold = 0.65  # Plate similarity threshold for merge (lowered to 0.65 to catch 41K34445 vs 41K449)
         self.reid_max_gap = 600  # Max frames to keep car in lost_cars pool (increased to cover larger gaps)
 
     def bbox_size_similarity(self, box1, box2):
